@@ -15,31 +15,102 @@
         }                                                                     \
     }
 
-// CUDA Kernel Definitions
+// // CUDA Kernel Definitions
+// __global__ void GaussianBlurKernel(float* d_image, float* d_blurred, int width, int height) {
+//     // Implement Gaussian blur logic
+//     int x = blockIdx.x * blockDim.x + threadIdx.x;
+//     int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+//     if (x >= width || y >= height) return;
+//     const float kernel[5][5] = {
+//         {1 / 273.0f, 4 / 273.0f, 7 / 273.0f, 4 / 273.0f, 1 / 273.0f},
+//         {4 / 273.0f,16 / 273.0f,26 / 273.0f,16 / 273.0f, 4 / 273.0f},
+//         {7 / 273.0f,26 / 273.0f,41 / 273.0f,26 / 273.0f, 7 / 273.0f},
+//         {4 / 273.0f,16 / 273.0f,26 / 273.0f,16 / 273.0f, 4 / 273.0f},
+//         {1 / 273.0f, 4 / 273.0f, 7 / 273.0f, 4 / 273.0f, 1 / 273.0f}
+//     };
+//     float sum = 0;
+
+//     for (int ky = -2; ky <= 2; ++ky) {
+//         for (int kx = -2; kx <= 2; ++kx) {
+//             int neighborX = min(max(x + kx, 0), width - 1);
+//             int neighborY = min(max(y + ky, 0), height - 1);
+//             sum += kernel[ky + 2][kx + 2] * d_image[neighborY * width + neighborX];
+//         }
+//     }
+//     d_blurred[y * width + x] = sum;
+// }
+
+__constant__ float d_kernel[5][5];
+#define BLOCK_SIZE 16
 __global__ void GaussianBlurKernel(float* d_image, float* d_blurred, int width, int height) {
-    // Implement Gaussian blur logic
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    // Shared memory for the tile
+    __shared__ float tile[BLOCK_SIZE + 4][BLOCK_SIZE + 4];
 
-    if (x >= width || y >= height) return;
-    const float kernel[5][5] = {
-        {1 / 273.0f, 4 / 273.0f, 7 / 273.0f, 4 / 273.0f, 1 / 273.0f},
-        {4 / 273.0f,16 / 273.0f,26 / 273.0f,16 / 273.0f, 4 / 273.0f},
-        {7 / 273.0f,26 / 273.0f,41 / 273.0f,26 / 273.0f, 7 / 273.0f},
-        {4 / 273.0f,16 / 273.0f,26 / 273.0f,16 / 273.0f, 4 / 273.0f},
-        {1 / 273.0f, 4 / 273.0f, 7 / 273.0f, 4 / 273.0f, 1 / 273.0f}
-    };
-    float sum = 0;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
 
-    for (int ky = -2; ky <= 2; ++ky) {
-        for (int kx = -2; kx <= 2; ++kx) {
-            int neighborX = min(max(x + kx, 0), width - 1);
-            int neighborY = min(max(y + ky, 0), height - 1);
-            sum += kernel[ky + 2][kx + 2] * d_image[neighborY * width + neighborX];
+    int x = blockIdx.x * blockDim.x + tx;
+    int y = blockIdx.y * blockDim.y + ty;
+
+    // Load shared memory with appropriate boundary handling
+    int sharedX = tx + 2; // +2 for kernel offset
+    int sharedY = ty + 2;
+    if (x < width && y < height) {
+        tile[sharedY][sharedX] = d_image[y * width + x];
+    } else {
+        tile[sharedY][sharedX] = 0.0f; // Zero-padding for out-of-bound pixels
+    }
+
+    // Load additional boundary pixels into shared memory
+    if (tx < 2) {
+        // Left border
+        if (x >= 2) {
+            tile[sharedY][tx] = d_image[y * width + (x - 2)];
+        } else {
+            tile[sharedY][tx] = 0.0f; // Padding
+        }
+
+        // Right border
+        if (x + blockDim.x < width) {
+            tile[sharedY][sharedX + blockDim.x] = d_image[y * width + (x + blockDim.x)];
+        } else {
+            tile[sharedY][sharedX + blockDim.x] = 0.0f;
         }
     }
-    d_blurred[y * width + x] = sum;
+
+    if (ty < 2) {
+        // Top border
+        if (y >= 2) {
+            tile[ty][sharedX] = d_image[(y - 2) * width + x];
+        } else {
+            tile[ty][sharedX] = 0.0f;
+        }
+
+        // Bottom border
+        if (y + blockDim.y < height) {
+            tile[sharedY + blockDim.y][sharedX] = d_image[(y + blockDim.y) * width + x];
+        } else {
+            tile[sharedY + blockDim.y][sharedX] = 0.0f;
+        }
+    }
+
+    // Wait for all threads to finish loading
+    __syncthreads();
+
+    // Perform the convolution only for valid pixels
+    if (x < width && y < height) {
+        float sum = 0.0f;
+        for (int ky = 0; ky < 5; ++ky) {
+            for (int kx = 0; kx < 5; ++kx) {
+                sum += d_kernel[ky][kx] * tile[sharedY + ky - 2][sharedX + kx - 2];
+            }
+        }
+        d_blurred[y * width + x] = sum;
+    }
 }
+
+
 
 __global__ void SobelKernel(float* d_blurred, float* d_gradient, float* d_direction, int width, int height) {
     // Implement gradient computation logic
@@ -156,6 +227,8 @@ __global__ void HysteresisKernel(float* d_edges, int width, int height) {
 void processSingleScale(float* d_image, float* d_output, int width, int height);
 void combineEdgeMaps(std::vector<cv::Mat>& edgeMaps, cv::Mat& output);
 
+
+
 // Multi-Scale Canny Implementation
 void multiScaleCanny(const cv::Mat& inputImage, std::vector<float> scales, cv::Mat& outputEdges) {
     int originalWidth = inputImage.cols;
@@ -165,6 +238,16 @@ void multiScaleCanny(const cv::Mat& inputImage, std::vector<float> scales, cv::M
 
     // For total time of multiScaleCanny
     auto totalStart = std::chrono::high_resolution_clock::now();
+    const float h_kernel[5][5] = {
+        {1 / 273.0f, 4 / 273.0f, 7 / 273.0f, 4 / 273.0f, 1 / 273.0f},
+        {4 / 273.0f,16 / 273.0f,26 / 273.0f,16 / 273.0f, 4 / 273.0f},
+        {7 / 273.0f,26 / 273.0f,41 / 273.0f,26 / 273.0f, 7 / 273.0f},
+        {4 / 273.0f,16 / 273.0f,26 / 273.0f,16 / 273.0f, 4 / 273.0f},
+        {1 / 273.0f, 4 / 273.0f, 7 / 273.0f, 4 / 273.0f, 1 / 273.0f}
+    };
+
+    // Copy the Gaussian kernel to constant memory
+    CUDA_CHECK(cudaMemcpyToSymbol(d_kernel, h_kernel, sizeof(h_kernel)));
 
     for (float scale : scales) {
         // Start timer for this scale
